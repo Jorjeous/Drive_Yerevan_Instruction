@@ -19,7 +19,8 @@ from openai import AsyncOpenAI
 load_dotenv()
 
 ROOT = Path(__file__).resolve().parent.parent
-QUESTIONS_PATH = ROOT / "questions.json"
+QUESTIONS_DIR = ROOT / "questions"
+DEFAULT_LANG = os.getenv("DEFAULT_LANG", "")
 PROGRESS_PATH = ROOT / "progress.json"
 PROBLEMS_PATH = ROOT / "problems.json"
 BALANCER_PATH = ROOT / "balancer.json"
@@ -34,41 +35,47 @@ EXAM_PASS = 18
 
 app = FastAPI(title="Road exam quiz")
 
-_questions: list[dict] = []
 _by_id: dict[str, dict] = {}
 _by_lang: dict[str, list[dict]] = {}
 _lang_index: dict[str, dict[str, int]] = {}
-_available_langs: list[str] = []
 _exam: dict[str, Any] | None = None
 
 
-def load_questions() -> None:
-    global _questions, _by_id, _by_lang, _lang_index, _available_langs
-    if not QUESTIONS_PATH.is_file():
-        raise RuntimeError(
-            f"Missing {QUESTIONS_PATH.name}. Run: python extract_questions.py"
-        )
-    data = json.loads(QUESTIONS_PATH.read_text(encoding="utf-8"))
-    _questions = data.get("questions", [])
-    _by_id = {q["id"]: q for q in _questions}
-    _by_lang = {}
-    for q in _questions:
-        _by_lang.setdefault(q.get("lang", "unknown"), []).append(q)
-    _available_langs = sorted(_by_lang.keys())
-    _lang_index = {}
-    for lang, qs in _by_lang.items():
-        _lang_index[lang] = {q["id"]: i for i, q in enumerate(qs)}
+def _available_langs() -> list[str]:
+    if not QUESTIONS_DIR.is_dir():
+        return []
+    return sorted(p.stem for p in QUESTIONS_DIR.glob("*.json"))
+
+
+def _load_lang(lang: str) -> None:
+    if lang in _by_lang:
+        return
+    path = QUESTIONS_DIR / f"{lang}.json"
+    if not path.is_file():
+        raise HTTPException(404, f"Language '{lang}' not available")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    qs = data.get("questions", [])
+    _by_lang[lang] = qs
+    _lang_index[lang] = {q["id"]: i for i, q in enumerate(qs)}
+    _by_id.update({q["id"]: q for q in qs})
 
 
 def _pool(lang: str | None = None) -> list[dict]:
-    if lang and lang in _by_lang:
-        return _by_lang[lang]
-    return _questions
+    if lang:
+        _load_lang(lang)
+        return _by_lang.get(lang, [])
+    for l in _available_langs():
+        try:
+            _load_lang(l)
+        except HTTPException:
+            pass
+    return [q for qs in _by_lang.values() for q in qs]
 
 
 def _qindex(q: dict, lang: str | None = None) -> int:
-    if lang and lang in _lang_index:
-        return _lang_index[lang].get(q["id"], -1)
+    l = lang or q.get("lang")
+    if l and l in _lang_index:
+        return _lang_index[l].get(q["id"], -1)
     return -1
 
 
@@ -122,7 +129,10 @@ def _atomic_write(path: Path, obj: Any) -> None:
 
 @app.on_event("startup")
 def startup() -> None:
-    load_questions()
+    if not QUESTIONS_DIR.is_dir():
+        raise RuntimeError("Missing questions/ directory. Run: python extract_questions.py")
+    if DEFAULT_LANG and (QUESTIONS_DIR / f"{DEFAULT_LANG}.json").is_file():
+        _load_lang(DEFAULT_LANG)
 
 
 class AnswerBody(BaseModel):
@@ -189,7 +199,7 @@ def _record_answer(qid: str, choice: int, ok: bool) -> None:
 
 @app.get("/api/languages")
 def get_languages() -> dict:
-    return {"languages": _available_langs}
+    return {"languages": _available_langs()}
 
 
 # ---- Practice mode ----
@@ -226,6 +236,12 @@ def get_question_at(index: int, lang: str = Query("")) -> dict:
 
 @app.get("/api/question/{qid}")
 def get_one(qid: str) -> dict:
+    if qid not in _by_id:
+        for lang in _available_langs():
+            try:
+                _load_lang(lang)
+            except HTTPException:
+                pass
     q = _by_id.get(qid)
     if not q:
         raise HTTPException(404, "Unknown question")
@@ -447,7 +463,7 @@ def complicated_question(lang: str = Query("")) -> dict:
     probs = load_problems()
     candidates = [_by_id[qid] for qid in probs if qid in _by_id and qid in pool_ids]
     if not candidates:
-        raise HTTPException(404, "Нет сложных вопросов")
+        raise HTTPException(404, "No hard questions")
     return _question_payload(random.choice(candidates), lang or None)
 
 
@@ -459,7 +475,7 @@ def balancer_question(lang: str = Query("")) -> dict:
     bal = load_balancer()
     filtered = [qid for qid in bal if qid in pool_ids and qid in _by_id]
     if not filtered:
-        raise HTTPException(404, "Балансир пуст — ошибок ещё нет")
+        raise HTTPException(404, "Balancer is empty")
     qid = random.choice(filtered)
     return _question_payload(_by_id[qid], lang or None)
 
@@ -523,18 +539,38 @@ async def explain_question(body: dict) -> dict:
 
     text = q["text"]
     options = q["options"]
-    prompt = (
-        "Это вопрос экзамена по ПДД Республики Армения. "
-        "При ответе опирайся в первую очередь на армянскую редакцию ПДД, "
-        "а не на российскую.\n\n"
-        f"Вопрос:\n{text}\n\nВарианты ответов:\n"
-    )
-    for i, opt in enumerate(options, 1):
-        prompt += f"{i}. {opt}\n"
-    prompt += (
-        f"\nПравильный ответ: {q['correctIndex'] + 1}. "
-        f"{options[q['correctIndex']]}\n"
-        "\nОбъясни, почему этот ответ правильный. Ответь на русском языке."
+    lang = q.get("lang", "ru")
+
+    _PROMPT_TEMPLATES = {
+        "ru": (
+            "Это вопрос экзамена по ПДД Республики Армения. "
+            "При ответе опирайся на армянскую редакцию ПДД.\n\n"
+            "Вопрос:\n{text}\n\nВарианты ответов:\n{opts}\n"
+            "Правильный ответ: {idx}. {answer}\n\n"
+            "Объясни, почему этот ответ правильный. Ответь на русском языке."
+        ),
+        "en": (
+            "This is an Armenian road exam question. "
+            "Base your explanation on Armenian traffic rules.\n\n"
+            "Question:\n{text}\n\nAnswer options:\n{opts}\n"
+            "Correct answer: {idx}. {answer}\n\n"
+            "Explain why this answer is correct. Answer in English."
+        ),
+        "am": (
+            "Սա Հայաստանի ճանապարհային քննության հարց է: "
+            "Պատասխանելիս հիմնվիր Հայաստանի ճանապարհային կանոնների վրա:\n\n"
+            "Հարց:\n{text}\n\nՊատասխանների տարբերակներ:\n{opts}\n"
+            "Ճիշտ պատասխան: {idx}. {answer}\n\n"
+            "Բացատրիր, թե ինչու է այս պատասխանը ճիշտ: Պատասխանիր հայերեն:"
+        ),
+    }
+    template = _PROMPT_TEMPLATES.get(lang, _PROMPT_TEMPLATES["ru"])
+    opts_str = "".join(f"{i}. {opt}\n" for i, opt in enumerate(options, 1))
+    prompt = template.format(
+        text=text,
+        opts=opts_str,
+        idx=q["correctIndex"] + 1,
+        answer=options[q["correctIndex"]],
     )
 
     content: list[dict] = []
@@ -542,19 +578,11 @@ async def explain_question(body: dict) -> dict:
     image_path = ROOT / image_file if image_file else None
     if image_path and image_path.is_file():
         img_data = base64.b64encode(image_path.read_bytes()).decode()
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{img_data}"},
-            }
-        )
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_data}"}})
     content.append({"type": "text", "text": prompt})
 
     try:
-        client = AsyncOpenAI(
-            api_key=LLM_API_KEY,
-            base_url=LLM_BASE_URL,
-        )
+        client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
         response = await client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": content}],
